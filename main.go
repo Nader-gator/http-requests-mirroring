@@ -11,21 +11,16 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	crypto_rand "crypto/rand"
-	"encoding/binary"
 	"flag"
-	"fmt"
-	"hash/crc64"
 	"io"
-	"io/ioutil"
 	"log"
-	math_rand "math/rand"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/IBM/sarama"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/examples/util"
 	"github.com/google/gopacket/layers"
@@ -34,22 +29,21 @@ import (
 	"github.com/google/gopacket/tcpassembly/tcpreader"
 )
 
-var fwdDestination = flag.String("destination", "", "Destination of the forwarded requests.")
-var fwdPerc = flag.Float64("percentage", 100, "Must be between 0 and 100.")
-var fwdBy = flag.String("percentage-by", "", "Can be empty. Otherwise, valid values are: header, remoteaddr.")
-var fwdHeader = flag.String("percentage-by-header", "", "If percentage-by is header, then specify the header here.")
-var reqPort = flag.Int("filter-request-port", 80, "Must be between 0 and 65535.")
-var keepHostHeader = flag.Bool("keep-host-header", false, "Keep Host header from original request.")
+var kafkaTopic = flag.String("kafka-topic", "", "Kafka topic to write to.")
+var kafkaBrokers = flag.String("kafka-brokers", "", "Comma-separated list of Kafka brokers.")
 
 // Build a simple HTTP request parser using tcpassembly.StreamFactory and tcpassembly.Stream interfaces
 
 // httpStreamFactory implements tcpassembly.StreamFactory
-type httpStreamFactory struct{}
+type httpStreamFactory struct {
+	producer sarama.SyncProducer
+}
 
 // httpStream will handle the actual decoding of http requests.
 type httpStream struct {
 	net, transport gopacket.Flow
 	r              tcpreader.ReaderStream
+	producer       sarama.SyncProducer
 }
 
 func (h *httpStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream {
@@ -57,6 +51,7 @@ func (h *httpStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream
 		net:       net,
 		transport: transport,
 		r:         tcpreader.NewReaderStream(),
+		producer:  h.producer,
 	}
 	go hstream.run() // Important... we must guarantee that data from the reader stream is read.
 
@@ -74,100 +69,47 @@ func (h *httpStream) run() {
 		} else if err != nil {
 			log.Println("Error reading stream", h.net, h.transport, ":", err)
 		} else {
-			reqSourceIP := h.net.Src().String()
-			reqDestionationPort := h.transport.Dst().String()
-			body, bErr := ioutil.ReadAll(req.Body)
+			body, bErr := io.ReadAll(req.Body)
 			if bErr != nil {
 				return
 			}
 			req.Body.Close()
-			go forwardRequest(req, reqSourceIP, reqDestionationPort, body)
+			go h.writeToKafka(req, body)
 		}
 	}
 }
 
-func forwardRequest(req *http.Request, reqSourceIP string, reqDestionationPort string, body []byte) {
+type RequestInfo struct {
+	Method  string      `json:"method"`
+	URL     string      `json:"url"`
+	Headers http.Header `json:"headers"`
+	Body    string      `json:"body"`
+}
 
-	// if percentage flag is not 100, then a percentage of requests is skipped
-	if *fwdPerc != 100 {
-		var uintForSeed uint64
-
-		if *fwdBy == "" {
-			// if percentage-by is empty, then forward only a certain percentage of requests
-			var b [8]byte
-			_, err := crypto_rand.Read(b[:])
-			if err != nil {
-				log.Println("Error generating crypto random unit for seed", ":", err)
-				return
-			}
-			// uintForSeed is random
-			uintForSeed = binary.LittleEndian.Uint64(b[:])
-		} else {
-			// if percentage-by is not empty, then forward only requests from a certain percentage of headers/remoteaddresses
-			strForSeed := ""
-			if *fwdBy == "header" {
-				strForSeed = req.Header.Get(*fwdHeader)
-			} else {
-				strForSeed = reqSourceIP
-			}
-			crc64Table := crc64.MakeTable(0xC96C5795D7870F42)
-			// uintForSeed is derived from strForSeed
-			uintForSeed = crc64.Checksum([]byte(strForSeed), crc64Table)
-		}
-
-		// generate a consistent random number from the variable uintForSeed
-		math_rand.Seed(int64(uintForSeed))
-		randomPercent := math_rand.Float64() * 100
-		// skip a percentage of requests
-		if randomPercent > *fwdPerc {
-			return
-		}
+func (h *httpStream) writeToKafka(req *http.Request, body []byte) {
+	requestInfo := &RequestInfo{
+		Method:  req.Method,
+		URL:     req.RequestURI,
+		Headers: req.Header,
+		Body:    string(body),
 	}
 
-	// create a new url from the raw RequestURI sent by the client
-	url := fmt.Sprintf("%s%s", string(*fwdDestination), req.RequestURI)
+	log.Println("Write to kafka:", requestInfo)
+	// jsonData, err := json.Marshal(requestInfo)
+	// if err != nil {
+	// 	log.Println("Error marshalling JSON:", err)
+	// 	return
+	// }
 
-	// create a new HTTP request
-	forwardReq, err := http.NewRequest(req.Method, url, bytes.NewReader(body))
-	if err != nil {
-		return
-	}
+	// msg := &sarama.ProducerMessage{
+	// 	Topic: *kafkaTopic,
+	// 	Value: sarama.StringEncoder(jsonData),
+	// }
 
-	// add headers to the new HTTP request
-	for header, values := range req.Header {
-		for _, value := range values {
-			forwardReq.Header.Add(header, value)
-		}
-	}
-
-	// Append to X-Forwarded-For the IP of the client or the IP of the latest proxy (if any proxies are in between)
-	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-For
-	forwardReq.Header.Add("X-Forwarded-For", reqSourceIP)
-	// The three following headers should contain 1 value only, i.e. the outermost port, protocol, and host
-	// https://tools.ietf.org/html/rfc7239#section-5.4
-	if forwardReq.Header.Get("X-Forwarded-Port") == "" {
-		forwardReq.Header.Set("X-Forwarded-Port", reqDestionationPort)
-	}
-	if forwardReq.Header.Get("X-Forwarded-Proto") == "" {
-		forwardReq.Header.Set("X-Forwarded-Proto", "http")
-	}
-	if forwardReq.Header.Get("X-Forwarded-Host") == "" {
-		forwardReq.Header.Set("X-Forwarded-Host", req.Host)
-	}
-
-	if *keepHostHeader {
-		forwardReq.Host = req.Host
-	}
-
-	// Execute the new HTTP request
-	httpClient := &http.Client{}
-	resp, rErr := httpClient.Do(forwardReq)
-	if rErr != nil {
-		// log.Println("Forward request error", ":", err)
-		return
-	}
-
-	defer resp.Body.Close()
+	// _, _, err = h.producer.SendMessage(msg)
+	// if err != nil {
+	// 	log.Println("Failed to send message to Kafka:", err)
+	// }
 }
 
 // Listen for incoming connections.
@@ -187,41 +129,37 @@ func openTCPClient() {
 	}
 }
 
-func main() {
+func run(netit string) {
 	defer util.Run()()
 	var handle *pcap.Handle
 	var err error
 
-	flag.Parse()
-	//labels validation
-	if *fwdPerc > 100 || *fwdPerc < 0 {
-		err = fmt.Errorf("Flag percentage is not between 0 and 100. Value: %f.", *fwdPerc)
-	} else if *fwdBy != "" && *fwdBy != "header" && *fwdBy != "remoteaddr" {
-		err = fmt.Errorf("Flag percentage-by (%s) is not valid.", *fwdBy)
-	} else if *fwdBy == "header" && *fwdHeader == "" {
-		err = fmt.Errorf("Flag percentage-by is set to header, but percentage-by-header is empty.")
-	} else if *reqPort > 65535 || *reqPort < 0 {
-		err = fmt.Errorf("Flag filter-request-port is not between 0 and 65535. Value: %f.", *fwdPerc)
+	if *kafkaTopic == "" || *kafkaBrokers == "" {
+		log.Fatal("Kafka topic and brokers must be specified.")
 	}
+
+	logfile, err := os.OpenFile("/home/ec2-user/logfile.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatal("Failed to open log file:", err)
+	}
+	defer logfile.Close()
+	// log.SetOutput(logfile)
+
+	config := sarama.NewConfig()
+	config.Producer.Return.Successes = true
+	producer, err := sarama.NewSyncProducer(strings.Split(*kafkaBrokers, ","), config)
+	if err != nil {
+		log.Println("Failed to create Kafka producer:", err)
+	}
+	// defer producer.Close()
+
+	log.Printf("Starting capture on interface %s", netit)
+	handle, err = pcap.OpenLive(netit, 262144, true, pcap.BlockForever)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	// Set up pcap packet capture
-	log.Printf("Starting capture on interface vxlan0")
-	handle, err = pcap.OpenLive("vxlan0", 8951, true, pcap.BlockForever)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Set up BPF filter
-	BPFFilter := fmt.Sprintf("%s%d", "tcp and dst port ", *reqPort)
-	if err := handle.SetBPFFilter(BPFFilter); err != nil {
-		log.Fatal(err)
-	}
-
 	// Set up assembly
-	streamFactory := &httpStreamFactory{}
+	streamFactory := &httpStreamFactory{producer: producer}
 	streamPool := tcpassembly.NewStreamPool(streamFactory)
 	assembler := tcpassembly.NewAssembler(streamPool)
 
@@ -232,7 +170,6 @@ func main() {
 	ticker := time.Tick(time.Minute)
 
 	//Open a TCP Client, for NLB Health Checks only
-	go openTCPClient()
 
 	for {
 		select {
@@ -253,4 +190,13 @@ func main() {
 			assembler.FlushOlderThan(time.Now().Add(time.Minute * -1))
 		}
 	}
+}
+func main() {
+	flag.Parse()
+	go openTCPClient()
+
+	go run("vxlan0")
+	go run("vxlan1")
+	c := make(chan struct{})
+	<-c
 }
