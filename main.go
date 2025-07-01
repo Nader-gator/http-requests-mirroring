@@ -32,14 +32,10 @@ import (
 var kafkaTopic = flag.String("kafka-topic", "", "Kafka topic to write to.")
 var kafkaBrokers = flag.String("kafka-brokers", "", "Comma-separated list of Kafka brokers.")
 
-// Build a simple HTTP request parser using tcpassembly.StreamFactory and tcpassembly.Stream interfaces
-
-// httpStreamFactory implements tcpassembly.StreamFactory
 type httpStreamFactory struct {
 	producer sarama.SyncProducer
 }
 
-// httpStream will handle the actual decoding of http requests.
 type httpStream struct {
 	net, transport gopacket.Flow
 	r              tcpreader.ReaderStream
@@ -55,7 +51,6 @@ func (h *httpStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream
 	}
 	go hstream.run() // Important... we must guarantee that data from the reader stream is read.
 
-	// ReaderStream implements tcpassembly.Stream, so we can return a pointer to it.
 	return &hstream.r
 }
 
@@ -194,9 +189,11 @@ func run(netit string) {
 func main() {
 	flag.Parse()
 	go openTCPClient()
+	go OtherListen()
+	// go OtherOtherOne()
 
-	go run("vxlan0")
-	go run("vxlan1")
+	// go run("lo")
+	// go run("vxlan1")
 	c := make(chan struct{})
 	<-c
 }
