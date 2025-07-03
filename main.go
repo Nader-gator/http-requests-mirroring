@@ -138,7 +138,7 @@ func run(netit string) {
 		log.Fatal("Failed to open log file:", err)
 	}
 	defer logfile.Close()
-	// log.SetOutput(logfile)
+	log.SetOutput(logfile)
 
 	config := sarama.NewConfig()
 	config.Producer.Return.Successes = true
@@ -189,11 +189,12 @@ func run(netit string) {
 func main() {
 	flag.Parse()
 	go openTCPClient()
-	go OtherListen()
+	// go OtherListen()
 	// go OtherOtherOne()
 
 	// go run("lo")
-	// go run("vxlan1")
+	go run("vxlan0")
+	go run("vxlan1")
 	c := make(chan struct{})
 	<-c
 }
